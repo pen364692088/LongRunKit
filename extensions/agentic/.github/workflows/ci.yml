@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  smoke-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Smoke Tests
+        run: make test-smoke
+        
+      - name: Upload Smoke Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-results
+          path: reports/
+          retention-days: 7
+
+  fast-tests:
+    runs-on: ubuntu-latest
+    needs: smoke-tests
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Fast Tests
+        run: make test-fast
+        
+      - name: Upload Fast Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-results
+          path: reports/
+          retention-days: 7
+
+  full-tests:
+    runs-on: ubuntu-latest
+    needs: fast-tests
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Full Tests
+        run: make test-full
+        
+      - name: Upload Full Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: full-results
+          path: reports/
+          retention-days: 7
+
+  oracle-check:
+    runs-on: ubuntu-latest
+    needs: smoke-tests
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check Oracle Baselines
+        run: |
+          mkdir -p reports/oracle
+          ./scripts/oracle_diff.sh --check || echo "Note: Oracle baselines may need update"
+        continue-on-error: true
