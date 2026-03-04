@@ -1,0 +1,7 @@
+[2026-03-03 21:31:31] Heartbeat started
+[2026-03-03 21:31:31] Starting task: Test notification
+[2026-03-03 21:31:31] Task type: ai_task
+[2026-03-03 21:31:31] Working directory: /home/moonlight/Project/Github/MyProject/LongRunKit/tools
+[2026-03-03 21:31:31] AI task: Test notification...
+[2026-03-03 21:31:31] Task completed: DONE
+[2026-03-03 21:31:31] Callback written to mailbox: /home/moonlight/.openclaw/workspace/mailbox/job_20260303_213131_67206baf_done.json

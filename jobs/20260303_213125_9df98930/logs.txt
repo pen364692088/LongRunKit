@@ -1,0 +1,9 @@
+[2026-03-03 21:31:26] Heartbeat started
+[2026-03-03 21:31:26] Starting task: Test idempotency
+[2026-03-03 21:31:26] Task type: ai_task
+[2026-03-03 21:31:26] Working directory: /home/moonlight/Project/Github/MyProject/LongRunKit/tools
+[2026-03-03 21:31:26] AI task: Test idempotency...
+[2026-03-03 21:31:26] Task completed: DONE
+[2026-03-03 21:31:26] Callback written to mailbox: /home/moonlight/.openclaw/workspace/mailbox/job_20260303_213125_9df98930_done.json
+[2026-03-03 21:31:31] Job already completed, skipping
+[2026-03-03 21:31:31] Callback written to mailbox: /home/moonlight/.openclaw/workspace/mailbox/job_20260303_213125_9df98930_done.json

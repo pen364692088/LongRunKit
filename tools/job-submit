@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""
+job-submit - 创建异步 Job 并 spawn worker
+
+用法:
+    job-submit "<task_description>" [options]
+
+选项:
+    --repo PATH           工作目录 (default: cwd)
+    --model MODEL         子代理模型 (default: qianfan-code-latest)
+    --timeout MINUTES     超时时间 (default: 30)
+    --max-attempts N      最大重试次数 (default: 3)
+    --notify-session ID   通知目标会话 (default: agent:main)
+
+输出:
+    job_id (立即可用)
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+import hashlib
+import subprocess
+
+# 默认配置
+JOBS_DIR = Path(__file__).parent.parent / "jobs"
+DEFAULT_MODEL = "baiduqianfancodingplan/qianfan-code-latest"
+DEFAULT_TIMEOUT = 30
+DEFAULT_MAX_ATTEMPTS = 3
+
+
+def generate_job_id():
+    """生成唯一 job_id: YYYYMMDD_HHMMSS_<short_hash>"""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    short_hash = hashlib.md5(os.urandom(8)).hexdigest()[:8]
+    return f"{ts}_{short_hash}"
+
+
+def create_job_dir(job_id: str) -> Path:
+    """创建 job 目录"""
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    return job_dir
+
+
+def write_spec(job_dir: Path, spec: dict):
+    """写入 spec.json"""
+    spec_path = job_dir / "spec.json"
+    with open(spec_path, "w") as f:
+        json.dump(spec, f, indent=2)
+    return spec_path
+
+
+def write_status(job_dir: Path, status: dict):
+    """写入 status.json"""
+    status_path = job_dir / "status.json"
+    with open(status_path, "w") as f:
+        json.dump(status, f, indent=2)
+    return status_path
+
+
+def spawn_worker(job_id: str, spec: dict) -> str:
+    """
+    使用 sessions_spawn 启动 worker
+    
+    注意：这里不阻塞等待，只返回 session_key
+    实际执行由 job-watchdog 监控
+    """
+    # 调用 subtask-orchestrate run 注册任务
+    # 但我们不用它来等待，只是借用 spawn 能力
+    
+    # 直接构造 sessions_spawn 调用
+    task_desc = f"Job {job_id}: {spec['title']}"
+    model = spec.get("model", DEFAULT_MODEL)
+    timeout = spec.get("constraints", {}).get("time_budget_min", DEFAULT_TIMEOUT)
+    
+    # 写入任务上下文到临时文件，供 worker 读取
+    context_file = Path(f"/tmp/job_{job_id}_context.txt")
+    context_file.write_text(json.dumps(spec, indent=2))
+    
+    print(f"Job ID: {job_id}")
+    print(f"Status: QUEUED")
+    print(f"To check status: cat {JOBS_DIR}/{job_id}/status.json")
+    print(f"To get result: cat {JOBS_DIR}/{job_id}/result.md")
+    print()
+    print("Worker will be spawned by job-watchdog or manual trigger.")
+    print("For immediate spawn, run:")
+    print(f"  sessions_spawn runtime=subagent model={model} task='job-worker {job_id}'")
+    
+    return job_id
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Submit async job")
+    parser.add_argument("task", help="Task description")
+    parser.add_argument("--repo", default=os.getcwd(), help="Working directory")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Worker model")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Timeout in minutes")
+    parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS, help="Max retry attempts")
+    parser.add_argument("--notify-session", default="agent:main", help="Notification target")
+    parser.add_argument("--title", help="Job title (default: first 50 chars of task)")
+    
+    args = parser.parse_args()
+    
+    # 生成 job_id
+    job_id = generate_job_id()
+    
+    # 构建 spec
+    title = args.title or args.task[:50]
+    idempotency_key = hashlib.sha256(args.task.encode()).hexdigest()[:16]
+    
+    spec = {
+        "job_id": job_id,
+        "title": title,
+        "task_type": "long_task",
+        "inputs": {
+            "repo": str(Path(args.repo).resolve()),
+            "goal": args.task
+        },
+        "constraints": {
+            "time_budget_min": args.timeout
+        },
+        "callbacks": {
+            "notify_session": args.notify_session
+        },
+        "model": args.model,
+        "idempotency_key": idempotency_key
+    }
+    
+    # 初始状态
+    now = datetime.now(timezone.utc).isoformat()
+    status = {
+        "job_id": job_id,
+        "state": "QUEUED",
+        "created_at": now,
+        "updated_at": now,
+        "heartbeat_at": None,
+        "attempt": 0,
+        "max_attempts": args.max_attempts,
+        "owner_session": "agent:main",
+        "worker_session": None,
+        "error": None
+    }
+    
+    # 创建目录和文件
+    job_dir = create_job_dir(job_id)
+    write_spec(job_dir, spec)
+    write_status(job_dir, status)
+    
+    # Spawn worker (异步，不阻塞)
+    spawn_worker(job_id, spec)
+    
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

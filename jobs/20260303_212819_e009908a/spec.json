@@ -1,0 +1,17 @@
+{
+  "job_id": "20260303_212819_e009908a",
+  "title": "Test Job A",
+  "task_type": "long_task",
+  "inputs": {
+    "repo": "/home/moonlight/Project/Github/MyProject/LongRunKit",
+    "goal": "Test job"
+  },
+  "constraints": {
+    "time_budget_min": 30
+  },
+  "callbacks": {
+    "notify_session": "agent:main"
+  },
+  "model": "baiduqianfancodingplan/qianfan-code-latest",
+  "idempotency_key": "58a6d6b289c44bde"
+}

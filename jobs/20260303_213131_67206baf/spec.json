@@ -1,0 +1,18 @@
+{
+  "job_id": "20260303_213131_67206baf",
+  "title": "Notification Test",
+  "task_type": "ai_task",
+  "inputs": {
+    "repo": "/home/moonlight/Project/Github/MyProject/LongRunKit/tools",
+    "goal": "Test notification",
+    "command": null
+  },
+  "constraints": {
+    "time_budget_min": 30
+  },
+  "callbacks": {
+    "notify_session": "agent:main"
+  },
+  "model": "baiduqianfancodingplan/qianfan-code-latest",
+  "idempotency_key": "16e136a5f46cfcaf"
+}

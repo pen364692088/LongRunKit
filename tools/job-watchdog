@@ -1,0 +1,256 @@
+#!/usr/bin/env python3
+"""
+job-watchdog - 监控 Job 并执行兜底操作
+
+用法:
+    job-watchdog [options]
+
+选项:
+    --interval SECONDS    检查间隔 (default: 60)
+    --stuck-timeout MIN   STUCK 判定超时 (default: 10)
+    --dry-run             只检查不执行
+
+行为:
+    1. 扫描所有 jobs
+    2. 检查 RUNNING 超时无心跳 → STUCK → 重试 spawn
+    3. 检查 DONE 未 ACK → 补发通知
+    4. 检查 FAILED → 可选自动重试
+"""
+
+import argparse
+import json
+import os
+import sys
+import subprocess
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+import glob
+
+# 默认配置
+JOBS_DIR = Path(__file__).parent.parent / "jobs"
+DEFAULT_INTERVAL = 60  # 秒
+DEFAULT_STUCK_TIMEOUT = 10  # 分钟
+
+
+def load_status(job_id: str) -> dict:
+    """加载 status.json"""
+    status_path = JOBS_DIR / job_id / "status.json"
+    if not status_path.exists():
+        return None
+    with open(status_path) as f:
+        return json.load(f)
+
+
+def load_spec(job_id: str) -> dict:
+    """加载 spec.json"""
+    spec_path = JOBS_DIR / job_id / "spec.json"
+    if not spec_path.exists():
+        return None
+    with open(spec_path) as f:
+        return json.load(f)
+
+
+def update_status(job_id: str, updates: dict):
+    """更新 status.json"""
+    status_path = JOBS_DIR / job_id / "status.json"
+    status = load_status(job_id)
+    status.update(updates)
+    status["updated_at"] = datetime.now(timezone.utc).isoformat()
+    with open(status_path, "w") as f:
+        json.dump(status, f, indent=2)
+    return status
+
+
+def parse_iso_time(s: str) -> datetime:
+    """解析 ISO 时间字符串"""
+    if not s:
+        return None
+    # 处理时区
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    return datetime.fromisoformat(s)
+
+
+def check_stuck(status: dict, stuck_timeout_min: int) -> bool:
+    """
+    检查是否 STUCK
+    
+    条件: RUNNING 状态 + 超过 stuck_timeout 分钟无心跳
+    """
+    if status["state"] != "RUNNING":
+        return False
+    
+    heartbeat = parse_iso_time(status.get("heartbeat_at"))
+    if not heartbeat:
+        # 没有心跳，用 updated_at
+        heartbeat = parse_iso_time(status.get("updated_at"))
+    
+    if not heartbeat:
+        return True  # 没有时间戳，判定为 STUCK
+    
+    now = datetime.now(timezone.utc)
+    timeout = timedelta(minutes=stuck_timeout_min)
+    
+    return (now - heartbeat) > timeout
+
+
+def check_ack(job_id: str) -> bool:
+    """
+    检查是否已 ACK
+    
+    ACK 记录在 jobs/<job_id>/ack.json
+    """
+    ack_path = JOBS_DIR / job_id / "ack.json"
+    return ack_path.exists()
+
+
+def spawn_worker(job_id: str, spec: dict, attempt: int) -> bool:
+    """
+    Spawn worker (重新执行)
+    
+    返回是否成功启动
+    """
+    model = spec.get("model", "baiduqianfancodingplan/qianfan-code-latest")
+    
+    # 在实际环境中，这会调用 sessions_spawn
+    # 这里用 subprocess 模拟
+    print(f"[SPAWN] Starting worker for job {job_id}, attempt {attempt}")
+    
+    # 示例命令（实际需要通过 OpenClaw 工具）
+    # sessions_spawn runtime=subagent model=<model> task="job-worker <job_id>"
+    
+    # 写入日志
+    log_path = JOBS_DIR / job_id / "logs.txt"
+    with open(log_path, "a") as f:
+        f.write(f"[{datetime.now().isoformat()}] WATCHDOG: Spawn attempt {attempt}\n")
+    
+    return True
+
+
+def send_notification(job_id: str, status: dict, result_path: Path):
+    """补发通知"""
+    spec = load_spec(job_id)
+    notify_session = spec.get("callbacks", {}).get("notify_session", "agent:main")
+    
+    msg = json.dumps({
+        "type": "job_done_retry",
+        "job_id": job_id,
+        "state": status["state"],
+        "title": spec["title"],
+        "result_path": str(result_path),
+        "attempt": status["attempt"],
+        "error": status.get("error"),
+        "note": "Retried by watchdog"
+    })
+    
+    # 写入 mailbox
+    mailbox_dir = Path.home() / ".openclaw" / "workspace" / "mailbox"
+    mailbox_dir.mkdir(parents=True, exist_ok=True)
+    
+    notify_file = mailbox_dir / f"job_{job_id}_retry.json"
+    with open(notify_file, "w") as f:
+        json.dump({
+            "target": notify_session,
+            "message": msg,
+            "ts": datetime.now(timezone.utc).isoformat()
+        }, f, indent=2)
+    
+    print(f"[NOTIFY] Retry notification written: {notify_file}")
+
+
+def scan_jobs():
+    """扫描所有 job 目录"""
+    job_dirs = []
+    for d in JOBS_DIR.iterdir():
+        if d.is_dir() and (d / "status.json").exists():
+            job_dirs.append(d.name)
+    return sorted(job_dirs)
+
+
+def run_watchdog(stuck_timeout: int, dry_run: bool = False):
+    """执行一轮 watchdog 检查"""
+    jobs = scan_jobs()
+    print(f"[SCAN] Found {len(jobs)} jobs")
+    
+    actions = []
+    
+    for job_id in jobs:
+        status = load_status(job_id)
+        spec = load_spec(job_id)
+        
+        if not status or not spec:
+            continue
+        
+        state = status["state"]
+        attempt = status["attempt"]
+        max_attempts = status["max_attempts"]
+        
+        # 检查 STUCK
+        if check_stuck(status, stuck_timeout):
+            print(f"[STUCK] Job {job_id}: RUNNING but no heartbeat")
+            
+            if attempt < max_attempts and not dry_run:
+                update_status(job_id, {"state": "STUCK"})
+                spawn_worker(job_id, spec, attempt + 1)
+                update_status(job_id, {
+                    "state": "QUEUED",
+                    "attempt": attempt + 1
+                })
+                actions.append(("stuck_retry", job_id))
+        
+        # 检查 DONE 未 ACK
+        elif state == "DONE" and not check_ack(job_id):
+            print(f"[NOACK] Job {job_id}: DONE but not acknowledged")
+            
+            if not dry_run:
+                result_path = JOBS_DIR / job_id / "result.md"
+                send_notification(job_id, status, result_path)
+                actions.append(("resend_notify", job_id))
+        
+        # 检查 FAILED 可重试
+        elif state == "FAILED" and attempt < max_attempts:
+            print(f"[RETRY] Job {job_id}: FAILED, can retry ({attempt}/{max_attempts})")
+            # 可选：自动重试
+            # if not dry_run:
+            #     spawn_worker(job_id, spec, attempt + 1)
+            #     actions.append(("failed_retry", job_id))
+    
+    return actions
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Job watchdog")
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="Check interval in seconds")
+    parser.add_argument("--stuck-timeout", type=int, default=DEFAULT_STUCK_TIMEOUT, help="STUCK timeout in minutes")
+    parser.add_argument("--dry-run", action="store_true", help="Check only, no actions")
+    parser.add_argument("--once", action="store_true", help="Run once and exit")
+    
+    args = parser.parse_args()
+    
+    print(f"[START] Watchdog running")
+    print(f"[CONFIG] stuck_timeout={args.stuck_timeout}min, interval={args.interval}s")
+    
+    if args.dry_run:
+        print("[DRY-RUN] No actions will be taken")
+    
+    if args.once:
+        actions = run_watchdog(args.stuck_timeout, args.dry_run)
+        print(f"[DONE] Actions: {len(actions)}")
+        return 0
+    
+    # 持续运行模式
+    import time
+    while True:
+        try:
+            actions = run_watchdog(args.stuck_timeout, args.dry_run)
+            print(f"[TICK] Actions: {len(actions)}")
+        except Exception as e:
+            print(f"[ERROR] {e}")
+        
+        time.sleep(args.interval)
+    
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

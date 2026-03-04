@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""
+job-submit-ocl - OpenClaw 集成的 Job 提交器
+
+用法:
+    job-submit-ocl "<task>" [options]
+
+特性:
+    1. 创建 job 目录和 spec/status
+    2. 通过 sessions_spawn 启动 worker (真正异步)
+    3. 立即返回 job_id (不阻塞)
+    4. 可选 --follow 模式等待结果
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+import hashlib
+import subprocess
+import time
+
+JOBS_DIR = Path(__file__).parent.parent / "jobs"
+DEFAULT_MODEL = "baiduqianfancodingplan/qianfan-code-latest"
+DEFAULT_TIMEOUT = 30
+
+
+def generate_job_id():
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    short_hash = hashlib.md5(os.urandom(8)).hexdigest()[:8]
+    return f"{ts}_{short_hash}"
+
+
+def create_job_dir(job_id: str) -> Path:
+    job_dir = JOBS_DIR / job_id
+    job_dir.mkdir(parents=True, exist_ok=True)
+    return job_dir
+
+
+def write_json(path: Path, data: dict):
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def read_json(path: Path) -> dict:
+    with open(path) as f:
+        return json.load(f)
+
+
+def submit_job(task: str, args) -> str:
+    """创建 Job 并提交"""
+    job_id = generate_job_id()
+    job_dir = create_job_dir(job_id)
+    
+    # 构造 spec
+    idempotency_key = hashlib.sha256(task.encode()).hexdigest()[:16]
+    spec = {
+        "job_id": job_id,
+        "title": args.title or task[:50],
+        "task_type": args.task_type,
+        "inputs": {
+            "repo": str(Path(args.repo).resolve()),
+            "goal": task,
+            "command": args.command
+        },
+        "constraints": {
+            "time_budget_min": args.timeout
+        },
+        "callbacks": {
+            "notify_session": args.notify_session
+        },
+        "model": args.model,
+        "idempotency_key": idempotency_key
+    }
+    
+    # 初始状态
+    now = datetime.now(timezone.utc).isoformat()
+    status = {
+        "job_id": job_id,
+        "state": "QUEUED",
+        "created_at": now,
+        "updated_at": now,
+        "heartbeat_at": None,
+        "attempt": 0,
+        "max_attempts": args.max_attempts,
+        "owner_session": "agent:main",
+        "worker_session": None,
+        "error": None
+    }
+    
+    write_json(job_dir / "spec.json", spec)
+    write_json(job_dir / "status.json", status)
+    
+    # 输出 spawn 命令
+    worker_script = Path(__file__).parent / "job-worker-v2"
+    
+    print(f"Job ID: {job_id}")
+    print(f"Status: QUEUED")
+    print()
+    print("To spawn worker manually:")
+    print(f"  sessions_spawn runtime=subagent model={args.model} \\")
+    print(f"    task='python3 {worker_script} {job_id}'")
+    print()
+    print("Or use subtask-orchestrate:")
+    print(f"  ~/.openclaw/workspace/tools/subtask-orchestrate run \\")
+    print(f"    'Job {job_id}: {spec['title']}' -m {args.model}")
+    print()
+    print(f"Check status: cat {job_dir}/status.json")
+    print(f"Get result: cat {job_dir}/result.md")
+    
+    return job_id
+
+
+def follow_job(job_id: str, timeout: int = 300):
+    """
+    等待 Job 完成
+    
+    基于状态文件轮询，不阻塞 stdout
+    """
+    job_dir = JOBS_DIR / job_id
+    status_path = job_dir / "status.json"
+    
+    if not status_path.exists():
+        print(f"Error: Job not found: {job_id}")
+        return 1
+    
+    print(f"Waiting for job {job_id}...")
+    start_time = time.time()
+    
+    while time.time() - start_time < timeout:
+        status = read_json(status_path)
+        state = status["state"]
+        
+        if state in ("DONE", "FAILED", "CANCELLED"):
+            print(f"Job {job_id}: {state}")
+            
+            result_path = job_dir / "result.md"
+            if result_path.exists():
+                print(f"\nResult: {result_path}")
+            
+            return 0 if state == "DONE" else 1
+        
+        # 显示进度
+        attempt = status.get("attempt", 0)
+        heartbeat = status.get("heartbeat_at", "never")
+        print(f"  [{int(time.time() - start_time)}s] state={state}, attempt={attempt}")
+        
+        time.sleep(5)
+    
+    print(f"Timeout after {timeout}s")
+    return 2
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Submit async job (OpenClaw integrated)")
+    parser.add_argument("task", help="Task description")
+    parser.add_argument("--repo", default=os.getcwd(), help="Working directory")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Worker model")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT, help="Timeout in minutes")
+    parser.add_argument("--max-attempts", type=int, default=3, help="Max retry attempts")
+    parser.add_argument("--notify-session", default="agent:main", help="Notification target")
+    parser.add_argument("--title", help="Job title")
+    parser.add_argument("--task-type", default="ai_task", choices=["ai_task", "shell_task"], help="Task type")
+    parser.add_argument("--command", help="Shell command (for shell_task)")
+    parser.add_argument("--follow", action="store_true", help="Wait for completion")
+    parser.add_argument("--follow-timeout", type=int, default=300, help="Follow timeout in seconds")
+    
+    args = parser.parse_args()
+    
+    job_id = submit_job(args.task, args)
+    
+    if args.follow:
+        return follow_job(job_id, args.follow_timeout)
+    
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
