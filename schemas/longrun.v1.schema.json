@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "longrun.v1.schema.json",
+  "title": "LongRun CLI Schema v1",
+  "description": "Schema for LongRunKit longrun CLI tool",
+  "type": "object",
+  "definitions": {
+    "Input": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "enum": ["init", "checkpoint", "run-once", "status", "test-smoke", "test-fast", "test-full", "report", "--health", "--sample"],
+          "description": "Command to execute"
+        },
+        "project": {
+          "type": "string",
+          "description": "Target project directory"
+        },
+        "note": {
+          "type": "string",
+          "description": "Checkpoint note"
+        }
+      }
+    },
+    "HealthOutput": {
+      "type": "object",
+      "required": ["status", "version", "checks"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["healthy", "unhealthy"]
+        },
+        "version": { "type": "string" },
+        "checks": {
+          "type": "object",
+          "properties": {
+            "templates_exists": { "type": "boolean" },
+            "extensions_exists": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "SampleOutput": {
+      "type": "object",
+      "required": ["status", "sample_result"],
+      "properties": {
+        "status": { "type": "string" },
+        "sample_result": {
+          "type": "object",
+          "properties": {
+            "version": { "type": "string" },
+            "templates": { "type": "string" }
+          }
+        }
+      }
+    },
+    "Error": {
+      "type": "object",
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "required": ["type", "message"],
+          "properties": {
+            "type": { "type": "string" },
+            "message": { "type": "string" },
+            "code": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}

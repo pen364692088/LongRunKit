@@ -247,6 +247,21 @@ USAGE
 main(){
   local cmd="${1:-help}"
   shift || true
+  
+  # Health check for tool_doctor
+  if [[ "$cmd" == "--health" ]]; then
+    checks='{"templates_exists":'"$([ -d "$TEMPLATES_DIR" ] && echo true || echo false)"',"extensions_exists":'"$([ -d "$EXTENSIONS_DIR" ] && echo true || echo false)"'}'
+    all_healthy=$([ -d "$TEMPLATES_DIR" ] && [ -d "$EXTENSIONS_DIR" ] && echo true || echo false)
+    echo "{\"status\":\"$($all_healthy && echo healthy || echo unhealthy)\",\"version\":\"$SCRIPT_VERSION\",\"checks\":$checks}"
+    exit $($all_healthy && echo 0 || echo 1)
+  fi
+  
+  # Sample call for tool_doctor
+  if [[ "$cmd" == "--sample" ]]; then
+    echo "{\"status\":\"ok\",\"sample_result\":{\"version\":\"$SCRIPT_VERSION\",\"templates\":\"$TEMPLATES_DIR\"}}"
+    exit 0
+  fi
+  
   case "$cmd" in
     init) cmd_init "$@";;
     checkpoint) cmd_checkpoint "$@";;
