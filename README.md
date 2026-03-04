@@ -99,14 +99,18 @@ LongRunKit/
 │       ├── ack.json        # ACK 记录
 │       └── .lock           # 文件锁
 ├── tools/
-│   ├── joblib.py           # 核心库 (原子写入、锁、lease)
-│   ├── jobctl              # 管理工具
+│   ├── joblib.py           # 核心库 (原子写入、锁、lease、安全)
+│   ├── jobctl              # 管理工具 (ls/show/tail/ack/cancel/retry)
 │   ├── job-submit-ocl      # 提交器
 │   ├── job-worker-v3       # 增强版 worker
-│   └── job-watchdog-v3     # 增强版 watchdog
+│   ├── job-watchdog-v3     # 增强版 watchdog
+│   ├── jobindex            # SQLite 索引
+│   ├── job-pool            # Worker Pool
+│   └── job-validator       # 安全验证
 └── tests/
-    ├── test-job-protocol.py    # v0.1 测试
-    └── test-job-protocol-v2.py # v0.2 测试
+    ├── test-job-protocol.py    # v0.1 测试 (5/5)
+    ├── test-job-protocol-v2.py # v0.2 测试 (9/9)
+    └── test-job-protocol-p2.py # P2 测试 (6/6)
 ```
 
 ## 状态机
@@ -198,15 +202,13 @@ python3 tests/test-job-protocol.py
 python3 tests/test-job-protocol-v2.py
 ```
 
-## 后续改进 (P1-P3)
+## 后续改进 (P3)
 
 | 优先级 | 改进 | 状态 |
 |--------|------|------|
-| P1 | SQLite 索引 (大量 job 时) | 🔜 |
-| P1 | Worker Pool (并发控制) | 🔜 |
-| P2 | Cancel/Pause/Resume | 🔜 |
-| P2 | 安全边界 (路径白名单) | 🔜 |
 | P3 | Web UI | 🔜 |
+| P3 | Cancel/Pause/Resume | ✅ (jobctl cancel 已实现) |
+| P3 | Worker Pool 自动扩缩容 | 🔜 |
 
 ## License
 
