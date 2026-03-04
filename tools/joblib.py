@@ -478,6 +478,167 @@ def should_retry(error_class: str, attempt: int, max_attempts: int) -> bool:
 
 JOBS_DIR = Path(__file__).parent.parent / "jobs"
 
+# ============ 安全边界 ============
+
+DANGEROUS_PATTERNS = [
+    r"[;&|`$]",           # Shell 元字符
+    r"\.\./",             # 路径遍历
+    r"\$[{(]",            # 变量替换
+    r"`",                 # 命令替换
+    r"\|",                # 管道
+    r">>",                # 重定向
+]
+
+DEFAULT_ALLOWED_ROOTS = [
+    "/home/moonlight/Project",
+    "/home/moonlight/.openclaw/workspace",
+    "/tmp",
+]
+
+
+class SecurityError(Exception):
+    """安全验证失败"""
+    pass
+
+
+def check_path_allowed(path: str, allowed_roots: list = None) -> tuple:
+    """
+    检查路径是否在允许的根目录下
+    
+    Returns:
+        (is_allowed, normalized_path_or_error)
+    """
+    allowed_roots = allowed_roots or DEFAULT_ALLOWED_ROOTS
+    
+    try:
+        normalized = str(Path(path).resolve())
+    except Exception as e:
+        return False, f"Invalid path: {e}"
+    
+    for root in allowed_roots:
+        root_normalized = str(Path(root).resolve())
+        if normalized.startswith(root_normalized):
+            return True, normalized
+    
+    return False, f"Path not in allowed roots: {normalized}"
+
+
+def check_path_traversal(path: str) -> bool:
+    """
+    检查路径遍历攻击
+    
+    Returns:
+        True 如果路径安全
+    """
+    if ".." in path:
+        return False
+    
+    encoded_patterns = [
+        "%2e%2e",
+        "%252e",
+        "..%2f",
+        "..%5c",
+    ]
+    
+    path_lower = path.lower()
+    for pattern in encoded_patterns:
+        if pattern in path_lower:
+            return False
+    
+    return True
+
+
+def check_command_injection(command: str) -> tuple:
+    """
+    检查命令注入
+    
+    Returns:
+        (is_safe, error_message)
+    """
+    import re
+    
+    for pattern in DANGEROUS_PATTERNS:
+        if re.search(pattern, command):
+            return False, f"Dangerous pattern detected: {pattern}"
+    
+    return True, ""
+
+
+def sanitize_input(text: str, max_length: int = 10000) -> str:
+    """
+    净化用户输入
+    """
+    import re
+    
+    if not text:
+        return ""
+    
+    text = text[:max_length]
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+    
+    return text
+
+
+def filter_sensitive_from_result(result: str) -> str:
+    """
+    从结果中过滤敏感信息
+    """
+    import re
+    
+    patterns = [
+        (r'(?i)(api[_-]?key|apikey)\s*[=:]\s*\S+', r'\1=***REDACTED***'),
+        (r'(?i)(token|bearer)\s*[=:]\s*\S+', r'\1=***REDACTED***'),
+        (r'(?i)(password|passwd|pwd)\s*[=:]\s*\S+', r'\1=***REDACTED***'),
+        (r'(?i)(secret|credential)\s*[=:]\s*\S+', r'\1=***REDACTED***'),
+    ]
+    
+    filtered = result
+    for pattern, replacement in patterns:
+        filtered = re.sub(pattern, replacement, filtered)
+    
+    return filtered
+
+
+def validate_spec(spec: dict) -> tuple:
+    """
+    验证 job spec
+    
+    Returns:
+        (is_valid, error_list)
+    """
+    import re
+    
+    errors = []
+    
+    required = ["job_id", "title", "task_type", "inputs"]
+    for field in required:
+        if field not in spec:
+            errors.append(f"Missing required field: {field}")
+    
+    inputs = spec.get("inputs", {})
+    repo = inputs.get("repo")
+    if repo:
+        is_allowed, msg = check_path_allowed(repo)
+        if not is_allowed:
+            errors.append(f"Invalid repo path: {msg}")
+    
+    command = inputs.get("command")
+    if command:
+        is_safe, msg = check_command_injection(command)
+        if not is_safe:
+            errors.append(f"Unsafe command: {msg}")
+    
+    title = spec.get("title", "")
+    if len(title) > 200:
+        errors.append("Title too long (max 200 chars)")
+    
+    task_type = spec.get("task_type")
+    valid_types = ["ai_task", "shell_task"]
+    if task_type and task_type not in valid_types:
+        errors.append(f"Invalid task_type: {task_type}")
+    
+    return len(errors) == 0, errors
+
 # ============ 通用工具 ============
 
 def generate_job_id() -> str:

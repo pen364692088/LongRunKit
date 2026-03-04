@@ -1,0 +1,262 @@
+#!/usr/bin/env python3
+"""
+jobindex.py - SQLite 索引管理
+
+用途:
+- 加速 job 查询 (避免扫目录)
+- 支持 state/updated_at/lease_until 过滤
+- 与文件存储同步
+
+使用:
+    jobindex init          # 初始化数据库
+    jobindex sync          # 同步所有 job 到索引
+    jobindex query --state RUNNING  # 查询
+"""
+
+import sqlite3
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+JOBS_DIR = Path(__file__).parent.parent / "jobs"
+INDEX_DB = JOBS_DIR / "index.db"
+
+
+def get_db() -> sqlite3.Connection:
+    """获取数据库连接"""
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(INDEX_DB))
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    """初始化数据库 schema"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS jobs (
+            job_id TEXT PRIMARY KEY,
+            state TEXT NOT NULL DEFAULT 'QUEUED',
+            created_at TEXT,
+            updated_at TEXT,
+            heartbeat_at TEXT,
+            attempt INTEGER DEFAULT 0,
+            max_attempts INTEGER DEFAULT 3,
+            lease_owner TEXT,
+            lease_until TEXT,
+            error_class TEXT,
+            notify_count INTEGER DEFAULT 0,
+            acked INTEGER DEFAULT 0,
+            title TEXT,
+            task_type TEXT,
+            owner_session TEXT,
+            worker_session TEXT,
+            _rev INTEGER DEFAULT 0
+        )
+    """)
+    
+    # 索引
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_state ON jobs(state)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_updated ON jobs(updated_at)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_lease ON jobs(lease_until)")
+    
+    conn.commit()
+    conn.close()
+    
+    print(f"✓ Index database initialized: {INDEX_DB}")
+
+
+def sync_job(job_id: str) -> bool:
+    """同步单个 job 到索引"""
+    job_dir = JOBS_DIR / job_id
+    
+    if not (job_dir / "status.json").exists():
+        return False
+    
+    # 读取 status
+    with open(job_dir / "status.json") as f:
+        status = json.load(f)
+    
+    # 读取 spec
+    spec = {}
+    if (job_dir / "spec.json").exists():
+        with open(job_dir / "spec.json") as f:
+            spec = json.load(f)
+    
+    # 检查 ACK
+    acked = 1 if (job_dir / "ack.json").exists() else 0
+    
+    # 插入或更新
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        INSERT OR REPLACE INTO jobs (
+            job_id, state, created_at, updated_at, heartbeat_at,
+            attempt, max_attempts, lease_owner, lease_until,
+            error_class, notify_count, acked, title, task_type,
+            owner_session, worker_session, _rev
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        job_id,
+        status.get("state", "QUEUED"),
+        status.get("created_at"),
+        status.get("updated_at"),
+        status.get("heartbeat_at"),
+        status.get("attempt", 0),
+        status.get("max_attempts", 3),
+        status.get("lease_owner"),
+        status.get("lease_until"),
+        status.get("error_class"),
+        status.get("notify_count", 0),
+        acked,
+        spec.get("title", ""),
+        spec.get("task_type", ""),
+        status.get("owner_session"),
+        status.get("worker_session"),
+        status.get("_rev", 0)
+    ))
+    
+    conn.commit()
+    conn.close()
+    
+    return True
+
+
+def sync_all():
+    """同步所有 job 到索引"""
+    init_db()
+    
+    count = 0
+    for d in JOBS_DIR.iterdir():
+        if d.is_dir() and (d / "status.json").exists():
+            if sync_job(d.name):
+                count += 1
+    
+    print(f"✓ Synced {count} jobs to index")
+
+
+def delete_job(job_id: str):
+    """从索引删除 job"""
+    conn = get_db()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+    conn.commit()
+    conn.close()
+
+
+def query_jobs(
+    state: Optional[str] = None,
+    stale_minutes: Optional[int] = None,
+    limit: int = 100
+) -> List[Dict[str, Any]]:
+    """
+    查询 jobs
+    
+    Args:
+        state: 过滤状态
+        stale_minutes: 过滤 N 分钟未更新的
+        limit: 最大返回数量
+    
+    Returns:
+        job 列表
+    """
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    sql = "SELECT * FROM jobs WHERE 1=1"
+    params = []
+    
+    if state:
+        sql += " AND state = ?"
+        params.append(state.upper())
+    
+    if stale_minutes:
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+        sql += " AND updated_at < ?"
+        params.append(cutoff.isoformat())
+    
+    sql += f" ORDER BY updated_at DESC LIMIT {limit}"
+    
+    cursor.execute(sql, params)
+    rows = cursor.fetchall()
+    
+    conn.close()
+    
+    return [dict(row) for row in rows]
+
+
+def get_stats() -> Dict[str, int]:
+    """获取统计信息"""
+    conn = get_db()
+    cursor = conn.cursor()
+    
+    cursor.execute("SELECT state, COUNT(*) as cnt FROM jobs GROUP BY state")
+    state_counts = {row["state"]: row["cnt"] for row in cursor.fetchall()}
+    
+    cursor.execute("SELECT COUNT(*) as cnt FROM jobs WHERE acked = 0 AND state = 'DONE'")
+    noack_count = cursor.fetchone()["cnt"]
+    
+    cursor.execute("SELECT COUNT(*) as cnt FROM jobs")
+    total = cursor.fetchone()["cnt"]
+    
+    conn.close()
+    
+    return {
+        "total": total,
+        "noack": noack_count,
+        **state_counts
+    }
+
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Job index management")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    # init
+    subparsers.add_parser("init", help="Initialize index database")
+    
+    # sync
+    subparsers.add_parser("sync", help="Sync all jobs to index")
+    
+    # query
+    query_parser = subparsers.add_parser("query", help="Query jobs")
+    query_parser.add_argument("--state", help="Filter by state")
+    query_parser.add_argument("--stale", type=int, help="Filter jobs not updated in N minutes")
+    query_parser.add_argument("--limit", type=int, default=100, help="Max results")
+    
+    # stats
+    subparsers.add_parser("stats", help="Show statistics")
+    
+    # delete
+    delete_parser = subparsers.add_parser("delete", help="Delete job from index")
+    delete_parser.add_argument("job_id", help="Job ID to delete")
+    
+    args = parser.parse_args()
+    
+    if args.command == "init":
+        init_db()
+    elif args.command == "sync":
+        sync_all()
+    elif args.command == "query":
+        jobs = query_jobs(args.state, args.stale, args.limit)
+        for job in jobs:
+            print(f"{job['job_id']}: {job['state']} (attempt={job['attempt']})")
+    elif args.command == "stats":
+        stats = get_stats()
+        print(json.dumps(stats, indent=2))
+    elif args.command == "delete":
+        delete_job(args.job_id)
+        print(f"✓ Deleted: {args.job_id}")
+
+
+if __name__ == "__main__":
+    from datetime import timedelta
+    main()

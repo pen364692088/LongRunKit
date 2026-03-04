@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+job-pool - Worker Pool 实现
+
+用途:
+- 固定并发控制 (max_concurrency)
+- Pool worker 轮询 QUEUED job
+- 避免大量 spawn 导致不稳定
+
+用法:
+    job-pool start --concurrency 5
+    job-pool status
+    job-pool stop
+"""
+
+import argparse
+import json
+import os
+import sys
+import time
+import subprocess
+import signal
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, List
+from concurrent.futures import ThreadPoolExecutor, Future
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from joblib import (
+    JOBS_DIR, read_status_with_rev, update_status_cas,
+    acquire_lease, release_lease, is_lease_expired,
+    log_worker_event, atomic_write_json
+)
+
+
+class WorkerPool:
+    def __init__(self, concurrency: int = 3, model: str = "baiduqianfancodingplan/qianfan-code-latest"):
+        self.concurrency = concurrency
+        self.model = model
+        self.running = False
+        self.executor: Optional[ThreadPoolExecutor] = None
+        self.futures: List[Future] = []
+        self.pool_id = f"pool:{os.getpid()}"
+        self.stop_event = threading.Event()
+        
+        # 统计
+        self.stats = {
+            "started": 0,
+            "completed": 0,
+            "failed": 0,
+            "claimed": 0
+        }
+        
+        # PID 文件
+        self.pid_file = JOBS_DIR / "pool.pid"
+        self.status_file = JOBS_DIR / "pool_status.json"
+    
+    def claim_job(self, job_id: str) -> bool:
+        """
+        尝试认领 job
+        
+        使用 CAS 保证只有一个 worker 能认领
+        """
+        job_dir = JOBS_DIR / job_id
+        
+        try:
+            status, rev = read_status_with_rev(job_dir)
+            
+            if not status:
+                return False
+            
+            if status["state"] != "QUEUED":
+                return False
+            
+            # 检查 lease
+            if not is_lease_expired(job_dir):
+                return False
+            
+            # 获取 lease
+            if not acquire_lease(job_dir, self.pool_id, duration_minutes=5):
+                return False
+            
+            # 更新状态
+            update_status_cas(job_dir, {
+                "state": "RUNNING",
+                "worker_session": self.pool_id,
+                "attempt": status.get("attempt", 0) + 1
+            }, use_lock=False)
+            
+            self.stats["claimed"] += 1
+            return True
+            
+        except Exception as e:
+            print(f"[CLAIM ERROR] {job_id}: {e}")
+            return False
+    
+    def execute_job(self, job_id: str) -> bool:
+        """
+        执行单个 job
+        
+        这里调用实际的 worker (job-worker-v3)
+        """
+        job_dir = JOBS_DIR / job_id
+        
+        try:
+            log_worker_event(job_dir, "pool_start", f"Pool worker starting: {self.pool_id}")
+            
+            # 调用 worker
+            worker_script = Path(__file__).parent / "job-worker-v3"
+            
+            result = subprocess.run(
+                ["python3", str(worker_script), job_id],
+                capture_output=True,
+                text=True,
+                timeout=3600  # 1 小时超时
+            )
+            
+            if result.returncode == 0:
+                self.stats["completed"] += 1
+                return True
+            else:
+                self.stats["failed"] += 1
+                log_worker_event(job_dir, "pool_error", f"Worker failed: {result.stderr[:200]}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            self.stats["failed"] += 1
+            log_worker_event(job_dir, "pool_timeout", "Worker timed out after 1 hour")
+            return False
+            
+        except Exception as e:
+            self.stats["failed"] += 1
+            log_worker_event(job_dir, "pool_exception", str(e))
+            return False
+            
+        finally:
+            # 释放 lease
+            release_lease(job_dir, self.pool_id)
+    
+    def scan_queued_jobs(self) -> List[str]:
+        """扫描 QUEUED 状态的 job"""
+        jobs = []
+        
+        for d in JOBS_DIR.iterdir():
+            if d.is_dir() and (d / "status.json").exists():
+                status, _ = read_status_with_rev(d)
+                if status and status.get("state") == "QUEUED":
+                    jobs.append(d.name)
+        
+        return jobs
+    
+    def worker_loop(self):
+        """单个 worker 的主循环"""
+        while not self.stop_event.is_set():
+            try:
+                # 扫描 QUEUED job
+                jobs = self.scan_queued_jobs()
+                
+                for job_id in jobs:
+                    if self.stop_event.is_set():
+                        break
+                    
+                    # 尝试认领
+                    if self.claim_job(job_id):
+                        self.stats["started"] += 1
+                        self.execute_job(job_id)
+                
+                # 等待下一次扫描
+                self.stop_event.wait(10)  # 10 秒间隔
+                
+            except Exception as e:
+                print(f"[WORKER ERROR] {e}")
+                time.sleep(5)
+    
+    def start(self):
+        """启动 worker pool"""
+        print(f"[START] Worker pool: concurrency={self.concurrency}, model={self.model}")
+        
+        self.running = True
+        self.stop_event.clear()
+        
+        # 写 PID 文件
+        atomic_write_json(self.pid_file, {
+            "pid": os.getpid(),
+            "pool_id": self.pool_id,
+            "concurrency": self.concurrency,
+            "started_at": datetime.now(timezone.utc).isoformat()
+        })
+        
+        # 创建线程池
+        self.executor = ThreadPoolExecutor(max_workers=self.concurrency)
+        
+        # 启动 worker
+        for i in range(self.concurrency):
+            future = self.executor.submit(self.worker_loop)
+            self.futures.append(future)
+        
+        print(f"[START] {self.concurrency} workers started")
+        
+        # 监控循环
+        try:
+            while self.running:
+                # 更新状态文件
+                self.update_status()
+                time.sleep(30)
+        except KeyboardInterrupt:
+            print("\n[STOP] Interrupted")
+            self.stop()
+    
+    def stop(self):
+        """停止 worker pool"""
+        print("[STOP] Stopping worker pool...")
+        
+        self.running = False
+        self.stop_event.set()
+        
+        # 等待所有 worker 完成
+        if self.executor:
+            self.executor.shutdown(wait=True)
+        
+        # 清理 PID 文件
+        if self.pid_file.exists():
+            self.pid_file.unlink()
+        
+        print(f"[STOP] Stats: {json.dumps(self.stats)}")
+    
+    def update_status(self):
+        """更新状态文件"""
+        atomic_write_json(self.status_file, {
+            "pool_id": self.pool_id,
+            "concurrency": self.concurrency,
+            "running": self.running,
+            "stats": self.stats,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        })
+    
+    def show_status(self):
+        """显示状态"""
+        if self.status_file.exists():
+            status = json.loads(self.status_file.read_text())
+            print(json.dumps(status, indent=2))
+        else:
+            print("Pool not running")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Worker pool")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    # start
+    start_parser = subparsers.add_parser("start", help="Start worker pool")
+    start_parser.add_argument("--concurrency", "-c", type=int, default=3, help="Max concurrent workers")
+    start_parser.add_argument("--model", "-m", default="baiduqianfancodingplan/qianfan-code-latest", help="Worker model")
+    
+    # status
+    subparsers.add_parser("status", help="Show pool status")
+    
+    # stop
+    subparsers.add_parser("stop", help="Stop worker pool")
+    
+    args = parser.parse_args()
+    
+    pool = WorkerPool()
+    
+    if args.command == "start":
+        pool = WorkerPool(args.concurrency, args.model)
+        pool.start()
+    elif args.command == "status":
+        pool.show_status()
+    elif args.command == "stop":
+        if pool.pid_file.exists():
+            pid_data = json.loads(pool.pid_file.read_text())
+            pid = pid_data.get("pid")
+            if pid:
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                    print(f"✓ Sent SIGTERM to pool (pid={pid})")
+                except ProcessLookupError:
+                    print("Pool process not found")
+                    pool.pid_file.unlink()
+        else:
+            print("Pool not running")
+
+
+if __name__ == "__main__":
+    main()

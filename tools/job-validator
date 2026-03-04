@@ -1,0 +1,309 @@
+#!/usr/bin/env python3
+"""
+job-validator.py - 安全边界验证
+
+用途:
+- 路径白名单验证
+- 输入净化
+- 命令注入防护
+
+使用:
+    job-validator check-path /path/to/repo
+    job-validator sanitize "user input"
+"""
+
+import os
+import re
+import shlex
+import sys
+import hashlib
+import json
+from pathlib import Path
+from typing import Tuple, Optional, List
+
+# 配置
+DEFAULT_ALLOWED_ROOTS = [
+    "/home/moonlight/Project",
+    "/home/moonlight/.openclaw/workspace",
+    "/tmp",
+]
+
+DANGEROUS_PATTERNS = [
+    r"[;&|`$]",           # Shell 元字符
+    r"\.\./",             # 路径遍历
+    r"\$[{(]",            # 变量替换
+    r"`",                 # 命令替换
+    r"\|",                # 管道
+    r">>",                # 重定向
+]
+
+
+class SecurityError(Exception):
+    """安全验证失败"""
+    pass
+
+
+def normalize_path(path: str) -> str:
+    """
+    规范化路径
+    
+    - 解析符号链接
+    - 去除相对路径
+    - 转为绝对路径
+    """
+    return str(Path(path).resolve())
+
+
+def check_path_allowed(path: str, allowed_roots: List[str] = None) -> Tuple[bool, str]:
+    """
+    检查路径是否在允许的根目录下
+    
+    Returns:
+        (is_allowed, normalized_path_or_error)
+    """
+    allowed_roots = allowed_roots or DEFAULT_ALLOWED_ROOTS
+    
+    try:
+        normalized = normalize_path(path)
+    except Exception as e:
+        return False, f"Invalid path: {e}"
+    
+    # 检查是否在允许的根目录下
+    for root in allowed_roots:
+        root_normalized = normalize_path(root)
+        if normalized.startswith(root_normalized):
+            return True, normalized
+    
+    return False, f"Path not in allowed roots: {normalized}"
+
+
+def check_path_traversal(path: str) -> bool:
+    """
+    检查路径遍历攻击
+    
+    Returns:
+        True 如果路径安全
+    """
+    # 检查 ../
+    if ".." in path:
+        return False
+    
+    # 检查编码的路径遍历
+    encoded_patterns = [
+        "%2e%2e",
+        "%252e",
+        "..%2f",
+        "..%5c",
+    ]
+    
+    path_lower = path.lower()
+    for pattern in encoded_patterns:
+        if pattern in path_lower:
+            return False
+    
+    return True
+
+
+def sanitize_input(text: str, max_length: int = 10000) -> str:
+    """
+    净化用户输入
+    
+    - 去除控制字符
+    - 限制长度
+    - 保留可打印字符
+    """
+    if not text:
+        return ""
+    
+    # 限制长度
+    text = text[:max_length]
+    
+    # 去除控制字符 (保留换行和制表符)
+    text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+    
+    return text
+
+
+def check_command_injection(command: str) -> Tuple[bool, str]:
+    """
+    检查命令注入
+    
+    Returns:
+        (is_safe, error_message)
+    """
+    for pattern in DANGEROUS_PATTERNS:
+        if re.search(pattern, command):
+            return False, f"Dangerous pattern detected: {pattern}"
+    
+    return True, ""
+
+
+def sanitize_command(command: str) -> str:
+    """
+    净化命令
+    
+    - 使用 shlex.quote 转义
+    - 移除危险字符
+    """
+    # 先检查
+    is_safe, error = check_command_injection(command)
+    if not is_safe:
+        raise SecurityError(error)
+    
+    # 不转义整个命令，而是建议使用参数列表
+    return command
+
+
+def hash_sensitive(text: str) -> str:
+    """
+    敏感信息哈希
+    
+    用于日志中记录敏感信息的指纹而非明文
+    """
+    return hashlib.sha256(text.encode()).hexdigest()[:16]
+
+
+def validate_spec(spec: dict) -> Tuple[bool, List[str]]:
+    """
+    验证 job spec
+    
+    Returns:
+        (is_valid, error_list)
+    """
+    errors = []
+    
+    # 检查必需字段
+    required = ["job_id", "title", "task_type", "inputs"]
+    for field in required:
+        if field not in spec:
+            errors.append(f"Missing required field: {field}")
+    
+    # 检查 repo 路径
+    inputs = spec.get("inputs", {})
+    repo = inputs.get("repo")
+    if repo:
+        is_allowed, msg = check_path_allowed(repo)
+        if not is_allowed:
+            errors.append(f"Invalid repo path: {msg}")
+    
+    # 检查命令 (如果有)
+    command = inputs.get("command")
+    if command:
+        is_safe, msg = check_command_injection(command)
+        if not is_safe:
+            errors.append(f"Unsafe command: {msg}")
+    
+    # 检查标题长度
+    title = spec.get("title", "")
+    if len(title) > 200:
+        errors.append("Title too long (max 200 chars)")
+    
+    # 检查任务类型
+    task_type = spec.get("task_type")
+    valid_types = ["ai_task", "shell_task"]
+    if task_type and task_type not in valid_types:
+        errors.append(f"Invalid task_type: {task_type}")
+    
+    return len(errors) == 0, errors
+
+
+def filter_sensitive_from_result(result: str) -> str:
+    """
+    从结果中过滤敏感信息
+    
+    - 密码
+    - Token
+    - 密钥
+    """
+    patterns = [
+        # API keys
+        (r'(?i)(api[_-]?key|apikey)\s*[=:]\s*\S+', r'\1=***REDACTED***'),
+        # Tokens
+        (r'(?i)(token|bearer)\s*[=:]\s*\S+', r'\1=***REDACTED***'),
+        # Passwords
+        (r'(?i)(password|passwd|pwd)\s*[=:]\s*\S+', r'\1=***REDACTED***'),
+        # Secrets
+        (r'(?i)(secret|credential)\s*[=:]\s*\S+', r'\1=***REDACTED***'),
+    ]
+    
+    filtered = result
+    for pattern, replacement in patterns:
+        filtered = re.sub(pattern, replacement, filtered)
+    
+    return filtered
+
+
+def main():
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Job security validator")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    # check-path
+    path_parser = subparsers.add_parser("check-path", help="Check if path is allowed")
+    path_parser.add_argument("path", help="Path to check")
+    path_parser.add_argument("--roots", nargs="+", help="Allowed root directories")
+    
+    # sanitize
+    sanitize_parser = subparsers.add_parser("sanitize", help="Sanitize user input")
+    sanitize_parser.add_argument("text", help="Text to sanitize")
+    sanitize_parser.add_argument("--max-length", type=int, default=10000)
+    
+    # check-command
+    cmd_parser = subparsers.add_parser("check-command", help="Check command for injection")
+    cmd_parser.add_argument("command", help="Command to check")
+    
+    # validate-spec
+    spec_parser = subparsers.add_parser("validate-spec", help="Validate job spec")
+    spec_parser.add_argument("spec_file", help="Path to spec.json")
+    
+    # filter-sensitive
+    filter_parser = subparsers.add_parser("filter-sensitive", help="Filter sensitive info from result")
+    filter_parser.add_argument("result_file", help="Path to result file")
+    
+    args = parser.parse_args()
+    
+    if args.command == "check-path":
+        is_allowed, msg = check_path_allowed(args.path, args.roots)
+        if is_allowed:
+            print(f"✓ Path allowed: {msg}")
+        else:
+            print(f"✗ Path not allowed: {msg}")
+            return 1
+    
+    elif args.command == "sanitize":
+        clean = sanitize_input(args.text, args.max_length)
+        print(clean)
+    
+    elif args.command == "check-command":
+        is_safe, msg = check_command_injection(args.command)
+        if is_safe:
+            print(f"✓ Command appears safe")
+        else:
+            print(f"✗ {msg}")
+            return 1
+    
+    elif args.command == "validate-spec":
+        with open(args.spec_file) as f:
+            spec = json.load(f)
+        is_valid, errors = validate_spec(spec)
+        if is_valid:
+            print(f"✓ Spec is valid")
+        else:
+            print("✗ Spec validation failed:")
+            for err in errors:
+                print(f"  - {err}")
+            return 1
+    
+    elif args.command == "filter-sensitive":
+        with open(args.result_file) as f:
+            result = f.read()
+        filtered = filter_sensitive_from_result(result)
+        print(filtered)
+    
+    return 0
+
+
+if __name__ == "__main__":
+    import json
+    sys.exit(main())
