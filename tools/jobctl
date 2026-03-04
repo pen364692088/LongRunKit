@@ -1,0 +1,413 @@
+#!/usr/bin/env python3
+"""
+jobctl - Job 管理工具
+
+用法:
+    jobctl ls [--state STATE] [--stale MINUTES]
+    jobctl show <job_id>
+    jobctl tail <job_id> [--lines N]
+    jobctl ack <job_id>
+    jobctl cancel <job_id> [--reason REASON]
+    jobctl retry <job_id>
+"""
+
+import argparse
+import json
+import os
+import sys
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Optional
+
+# 添加 tools 目录到 path
+sys.path.insert(0, str(Path(__file__).parent))
+
+from joblib import (
+    read_status_with_rev, is_acked, parse_iso_time,
+    generate_job_id, atomic_write_json, update_status_safe,
+    mark_acked, ErrorClass
+)
+
+JOBS_DIR = Path(__file__).parent.parent / "jobs"
+
+
+def scan_jobs() -> list:
+    """扫描所有 job 目录"""
+    jobs = []
+    for d in JOBS_DIR.iterdir():
+        if d.is_dir() and (d / "status.json").exists():
+            jobs.append(d.name)
+    return sorted(jobs, reverse=True)
+
+
+def format_duration(seconds: float) -> str:
+    """格式化时长"""
+    if seconds < 60:
+        return f"{int(seconds)}s"
+    elif seconds < 3600:
+        return f"{int(seconds / 60)}m"
+    else:
+        return f"{seconds / 3600:.1f}h"
+
+
+def format_age(dt: datetime) -> str:
+    """格式化时间间隔"""
+    now = datetime.now(timezone.utc)
+    delta = now - dt
+    
+    if delta.total_seconds() < 60:
+        return "just now"
+    elif delta.total_seconds() < 3600:
+        return f"{int(delta.total_seconds() / 60)}m ago"
+    elif delta.total_seconds() < 86400:
+        return f"{int(delta.total_seconds() / 3600)}h ago"
+    else:
+        return f"{int(delta.total_seconds() / 86400)}d ago"
+
+
+def cmd_list(args):
+    """列出 jobs"""
+    jobs = scan_jobs()
+    
+    # 过滤状态
+    if args.state:
+        jobs = [j for j in jobs if get_job_state(j) == args.state.upper()]
+    
+    # 过滤过期
+    if args.stale:
+        stale_minutes = args.stale
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+        jobs = [j for j in jobs if get_job_updated(j) < cutoff]
+    
+    if not jobs:
+        print("No jobs found.")
+        return 0
+    
+    # 表头
+    print(f"{'JOB_ID':<26} {'STATE':<10} {'AGE':<10} {'ATTEMPT':<8} {'ACK':<5} {'TITLE':<30}")
+    print("-" * 95)
+    
+    for job_id in jobs[:20]:  # 最多显示 20 个
+        status, _ = read_status_with_rev(JOBS_DIR / job_id)
+        
+        if not status:
+            continue
+        
+        state = status.get("state", "?")
+        created = parse_iso_time(status.get("created_at"))
+        age = format_age(created) if created else "?"
+        attempt = f"{status.get('attempt', 0)}/{status.get('max_attempts', 3)}"
+        acked = "✓" if is_acked(JOBS_DIR / job_id) else "✗"
+        title = status.get("title", job_id)[:30]
+        
+        # 状态颜色
+        state_color = {
+            "DONE": "\033[92m",      # 绿
+            "FAILED": "\033[91m",    # 红
+            "RUNNING": "\033[93m",   # 黄
+            "STUCK": "\033[95m",     # 紫
+            "QUEUED": "\033[90m",    # 灰
+        }.get(state, "")
+        reset_color = "\033[0m" if state_color else ""
+        
+        print(f"{job_id:<26} {state_color}{state:<10}{reset_color} {age:<10} {attempt:<8} {acked:<5} {title:<30}")
+    
+    if len(jobs) > 20:
+        print(f"\n... and {len(jobs) - 20} more")
+    
+    return 0
+
+
+def get_job_state(job_id: str) -> str:
+    """获取 job 状态"""
+    status, _ = read_status_with_rev(JOBS_DIR / job_id)
+    return status.get("state", "?") if status else "?"
+
+
+def get_job_updated(job_id: str) -> datetime:
+    """获取 job 更新时间"""
+    status, _ = read_status_with_rev(JOBS_DIR / job_id)
+    return parse_iso_time(status.get("updated_at")) if status else None
+
+
+def cmd_show(args):
+    """显示 job 详情"""
+    job_dir = JOBS_DIR / args.job_id
+    
+    if not job_dir.exists():
+        print(f"Error: Job not found: {args.job_id}")
+        return 1
+    
+    status, rev = read_status_with_rev(job_dir)
+    
+    if not status:
+        print(f"Error: No status for job: {args.job_id}")
+        return 1
+    
+    # 加载 spec
+    spec_path = job_dir / "spec.json"
+    spec = {}
+    if spec_path.exists():
+        with open(spec_path) as f:
+            spec = json.load(f)
+    
+    # 加载 result
+    result_path = job_dir / "result.md"
+    result_preview = None
+    if result_path.exists():
+        result_text = result_path.read_text()
+        result_preview = result_text[:500] + "..." if len(result_text) > 500 else result_text
+    
+    # 打印详情
+    print(f"Job: {args.job_id}")
+    print("=" * 60)
+    print()
+    
+    print("Status:")
+    print(f"  State: {status.get('state', '?')}")
+    print(f"  Attempt: {status.get('attempt', 0)}/{status.get('max_attempts', 3)}")
+    print(f"  Rev: {rev}")
+    print(f"  Created: {status.get('created_at', '?')}")
+    print(f"  Updated: {status.get('updated_at', '?')}")
+    
+    if status.get("lease_owner"):
+        print(f"  Lease Owner: {status.get('lease_owner')}")
+        print(f"  Lease Until: {status.get('lease_until')}")
+    
+    if status.get("heartbeat_at"):
+        heartbeat = parse_iso_time(status.get("heartbeat_at"))
+        if heartbeat:
+            age = format_age(heartbeat)
+            print(f"  Heartbeat: {age}")
+    
+    if is_acked(job_dir):
+        print(f"  ACK: ✓ ({status.get('acked_at', '?')})")
+    else:
+        print(f"  ACK: ✗")
+    
+    if status.get("error"):
+        print(f"\nError:")
+        print(f"  Class: {status.get('error_class', 'UNKNOWN')}")
+        print(f"  Message: {status.get('error', '?')[:200]}")
+    
+    print()
+    print("Spec:")
+    print(f"  Title: {spec.get('title', '?')}")
+    print(f"  Type: {spec.get('task_type', '?')}")
+    
+    inputs = spec.get("inputs", {})
+    if inputs.get("goal"):
+        print(f"  Goal: {inputs.get('goal')[:100]}...")
+    if inputs.get("repo"):
+        print(f"  Repo: {inputs.get('repo')}")
+    
+    print()
+    print("Callbacks:")
+    print(f"  Notify: {spec.get('callbacks', {}).get('notify_session', 'agent:main')}")
+    
+    # 通知统计
+    print()
+    print("Notifications:")
+    print(f"  Count: {status.get('notify_count', 0)}")
+    if status.get("last_notify_at"):
+        last = parse_iso_time(status.get("last_notify_at"))
+        if last:
+            print(f"  Last: {format_age(last)}")
+    
+    # 结果预览
+    if result_preview:
+        print()
+        print("Result Preview:")
+        print("-" * 40)
+        print(result_preview[:300])
+    
+    return 0
+
+
+def cmd_tail(args):
+    """查看日志"""
+    job_dir = JOBS_DIR / args.job_id
+    log_path = job_dir / "logs.ndjson"
+    
+    if not log_path.exists():
+        # 尝试旧格式
+        old_log_path = job_dir / "logs.txt"
+        if old_log_path.exists():
+            lines = old_log_path.read_text().strip().split("\n")
+            for line in lines[-args.lines:]:
+                print(line)
+            return 0
+        
+        print(f"No logs found for job: {args.job_id}")
+        return 1
+    
+    with open(log_path) as f:
+        lines = f.readlines()
+    
+    for line in lines[-args.lines:]:
+        try:
+            event = json.loads(line)
+            ts = event.get("ts", "")[:19]
+            level = event.get("level", "INFO")[:5]
+            source = event.get("source", "?")[:8]
+            msg = event.get("message", "")
+            
+            # 颜色
+            level_color = {
+                "ERROR": "\033[91m",
+                "WARN": "\033[93m",
+                "INFO": "\033[0m",
+                "DEBUG": "\033[90m",
+            }.get(level, "")
+            reset = "\033[0m" if level_color else ""
+            
+            print(f"{ts} {level_color}{level:<5}{reset} [{source}] {msg}")
+        except:
+            print(line.strip())
+    
+    return 0
+
+
+def cmd_ack(args):
+    """标记 ACK"""
+    job_dir = JOBS_DIR / args.job_id
+    
+    if not job_dir.exists():
+        print(f"Error: Job not found: {args.job_id}")
+        return 1
+    
+    status, _ = read_status_with_rev(job_dir)
+    
+    if not status:
+        print(f"Error: No status for job: {args.job_id}")
+        return 1
+    
+    if is_acked(job_dir):
+        print(f"Job already acknowledged: {args.job_id}")
+        return 0
+    
+    mark_acked(job_dir, args.by or "manual")
+    
+    print(f"✓ Job acknowledged: {args.job_id}")
+    return 0
+
+
+def cmd_cancel(args):
+    """取消 job"""
+    job_dir = JOBS_DIR / args.job_id
+    
+    if not job_dir.exists():
+        print(f"Error: Job not found: {args.job_id}")
+        return 1
+    
+    status, _ = read_status_with_rev(job_dir)
+    
+    if not status:
+        print(f"Error: No status for job: {args.job_id}")
+        return 1
+    
+    state = status.get("state")
+    if state in ("DONE", "FAILED", "CANCELLED"):
+        print(f"Error: Cannot cancel job in state: {state}")
+        return 1
+    
+    reason = args.reason or "Manual cancellation"
+    
+    update_status_safe(job_dir, {
+        "state": "CANCELLED",
+        "error": reason,
+        "error_class": ErrorClass.CANCELLED
+    })
+    
+    print(f"✓ Job cancelled: {args.job_id}")
+    return 0
+
+
+def cmd_retry(args):
+    """重试 job"""
+    job_dir = JOBS_DIR / args.job_id
+    
+    if not job_dir.exists():
+        print(f"Error: Job not found: {args.job_id}")
+        return 1
+    
+    status, _ = read_status_with_rev(job_dir)
+    
+    if not status:
+        print(f"Error: No status for job: {args.job_id}")
+        return 1
+    
+    state = status.get("state")
+    if state not in ("FAILED", "STUCK", "CANCELLED"):
+        print(f"Error: Can only retry FAILED/STUCK/CANCELLED jobs (current: {state})")
+        return 1
+    
+    attempt = status.get("attempt", 0)
+    max_attempts = status.get("max_attempts", 3)
+    
+    if attempt >= max_attempts:
+        print(f"Error: Max attempts reached ({attempt}/{max_attempts})")
+        return 1
+    
+    # 重置状态
+    update_status_safe(job_dir, {
+        "state": "QUEUED",
+        "lease_owner": None,
+        "lease_until": None,
+        "error": None,
+        "error_class": None
+    })
+    
+    print(f"✓ Job queued for retry: {args.job_id}")
+    print(f"  Attempt will be: {attempt + 1}/{max_attempts}")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Job control tool")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    # ls
+    ls_parser = subparsers.add_parser("ls", help="List jobs")
+    ls_parser.add_argument("--state", help="Filter by state")
+    ls_parser.add_argument("--stale", type=int, help="Filter jobs not updated in N minutes")
+    
+    # show
+    show_parser = subparsers.add_parser("show", help="Show job details")
+    show_parser.add_argument("job_id", help="Job ID")
+    
+    # tail
+    tail_parser = subparsers.add_parser("tail", help="Show job logs")
+    tail_parser.add_argument("job_id", help="Job ID")
+    tail_parser.add_argument("--lines", "-n", type=int, default=20, help="Number of lines")
+    
+    # ack
+    ack_parser = subparsers.add_parser("ack", help="Acknowledge job")
+    ack_parser.add_argument("job_id", help="Job ID")
+    ack_parser.add_argument("--by", help="Who is acknowledging")
+    
+    # cancel
+    cancel_parser = subparsers.add_parser("cancel", help="Cancel job")
+    cancel_parser.add_argument("job_id", help="Job ID")
+    cancel_parser.add_argument("--reason", help="Cancellation reason")
+    
+    # retry
+    retry_parser = subparsers.add_parser("retry", help="Retry job")
+    retry_parser.add_argument("job_id", help="Job ID")
+    
+    args = parser.parse_args()
+    
+    commands = {
+        "ls": cmd_list,
+        "show": cmd_show,
+        "tail": cmd_tail,
+        "ack": cmd_ack,
+        "cancel": cmd_cancel,
+        "retry": cmd_retry,
+    }
+    
+    return commands[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,333 @@
+#!/usr/bin/env python3
+"""
+job-watchdog-v3 - 增强版 Watchdog (v0.2)
+
+增强:
+1. Lease 检查 (不误判活跃 worker)
+2. 通知退避 (指数退避 + 抖动)
+3. 错误分类 (只对 TRANSIENT 重试)
+4. 结构化日志
+"""
+
+import argparse
+import json
+import os
+import sys
+import subprocess
+import time
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+import random
+
+# 添加 tools 目录到 path
+sys.path.insert(0, str(Path(__file__).parent))
+
+from joblib import (
+    JOBS_DIR, read_status_with_rev, is_lease_expired, is_acked,
+    update_status_safe, acquire_lease, release_lease,
+    should_notify, record_notify, log_watchdog_event,
+    classify_error, should_retry, ErrorClass, atomic_write_json,
+    parse_iso_time
+)
+
+DEFAULT_STUCK_TIMEOUT = 10  # 分钟
+DEFAULT_INTERVAL = 60  # 秒
+
+
+def load_spec(job_id: str) -> dict:
+    """加载 spec.json"""
+    spec_path = JOBS_DIR / job_id / "spec.json"
+    if not spec_path.exists():
+        return None
+    with open(spec_path) as f:
+        return json.load(f)
+
+
+def spawn_worker(job_id: str, spec: dict, attempt: int) -> bool:
+    """
+    Spawn worker (重新执行)
+    
+    Returns:
+        是否成功启动
+    """
+    model = spec.get("model", "baiduqianfancodingplan/qianfan-code-latest")
+    job_dir = JOBS_DIR / job_id
+    
+    log_watchdog_event(job_dir, "spawn", f"Attempt {attempt}, model={model}")
+    
+    # 在实际环境中，这会调用 sessions_spawn
+    # 这里写入一个标记文件
+    spawn_marker = job_dir / ".spawn_pending"
+    atomic_write_json(spawn_marker, {
+        "job_id": job_id,
+        "attempt": attempt,
+        "model": model,
+        "ts": datetime.now(timezone.utc).isoformat()
+    })
+    
+    print(f"[SPAWN] Would spawn worker for {job_id}, attempt {attempt}")
+    print(f"  sessions_spawn runtime=subagent model={model} task='python3 job-worker-v3 {job_id}'")
+    
+    return True
+
+
+def send_notification(job_id: str, status: dict, result_path: Path):
+    """补发通知"""
+    job_dir = JOBS_DIR / job_id
+    spec = load_spec(job_id)
+    
+    if not spec:
+        return
+    
+    notify_session = spec.get("callbacks", {}).get("notify_session", "agent:main")
+    
+    msg = json.dumps({
+        "type": "job_done_retry",
+        "job_id": job_id,
+        "state": status["state"],
+        "title": spec["title"],
+        "result_path": str(result_path),
+        "attempt": status["attempt"],
+        "error": status.get("error"),
+        "error_class": status.get("error_class"),
+        "note": "Retried by watchdog"
+    })
+    
+    # 写入 mailbox
+    mailbox_dir = Path.home() / ".openclaw" / "workspace" / "mailbox"
+    mailbox_dir.mkdir(parents=True, exist_ok=True)
+    
+    notify_file = mailbox_dir / f"job_{job_id}_retry_{int(time.time())}.json"
+    atomic_write_json(notify_file, {
+        "target": notify_session,
+        "message": msg,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "retry": True
+    })
+    
+    # 记录通知
+    record_notify(job_dir)
+    
+    log_watchdog_event(job_dir, "notify_retry", f"Written to {notify_file}")
+    
+    print(f"[NOTIFY] Retry notification: {notify_file}")
+
+
+def check_stuck_with_lease(job_id: str, stuck_timeout: int) -> bool:
+    """
+    检查是否 STUCK (考虑 lease)
+    
+    只在 lease 过期时判定为 STUCK
+    """
+    job_dir = JOBS_DIR / job_id
+    status, _ = read_status_with_rev(job_dir)
+    
+    if not status:
+        return False
+    
+    if status["state"] != "RUNNING":
+        return False
+    
+    # 检查 lease
+    if not is_lease_expired(job_dir):
+        # lease 仍然有效，不是 STUCK
+        return False
+    
+    # lease 过期，检查心跳
+    heartbeat = parse_iso_time(status.get("heartbeat_at"))
+    if not heartbeat:
+        heartbeat = parse_iso_time(status.get("updated_at"))
+    
+    if not heartbeat:
+        return True  # 没有时间戳，判定为 STUCK
+    
+    now = datetime.now(timezone.utc)
+    timeout = timedelta(minutes=stuck_timeout)
+    
+    return (now - heartbeat) > timeout
+
+
+def handle_stuck_job(job_id: str, status: dict, dry_run: bool):
+    """处理 STUCK 任务"""
+    job_dir = JOBS_DIR / job_id
+    spec = load_spec(job_id)
+    
+    if not spec:
+        return
+    
+    attempt = status.get("attempt", 0)
+    max_attempts = status.get("max_attempts", 3)
+    error_class = status.get("error_class")
+    
+    log_watchdog_event(job_dir, "stuck_detected", 
+                       f"attempt={attempt}/{max_attempts}, lease_expired=True")
+    
+    # 检查是否应该重试
+    if attempt >= max_attempts:
+        log_watchdog_event(job_dir, "stuck_final", "Max attempts reached, marking FAILED")
+        
+        if not dry_run:
+            update_status_safe(job_dir, {
+                "state": "FAILED",
+                "error": "STUCK: Max attempts reached",
+                "error_class": ErrorClass.TIMEOUT
+            })
+        
+        print(f"[STUCK] {job_id}: Max attempts reached, marked FAILED")
+        return
+    
+    # 重试
+    print(f"[STUCK] {job_id}: Attempt {attempt}/{max_attempts}, will retry")
+    
+    if not dry_run:
+        # 标记为 STUCK
+        update_status_safe(job_dir, {
+            "state": "STUCK",
+            "error": "STUCK: Lease expired, no heartbeat",
+            "error_class": ErrorClass.TIMEOUT
+        })
+        
+        # 重置为 QUEUED
+        update_status_safe(job_dir, {
+            "state": "QUEUED",
+            "lease_owner": None,
+            "lease_until": None
+        })
+        
+        # Spawn worker
+        spawn_worker(job_id, spec, attempt + 1)
+
+
+def handle_done_noack(job_id: str, status: dict, dry_run: bool):
+    """处理 DONE 但未 ACK 的任务"""
+    job_dir = JOBS_DIR / job_id
+    
+    # 检查是否应该发送通知 (退避)
+    if not should_notify(job_dir):
+        notify_count = status.get("notify_count", 0)
+        last_notify = status.get("last_notify_at")
+        
+        log_watchdog_event(job_dir, "noack_skip", 
+                           f"notify_count={notify_count}, last={last_notify}, in cooldown")
+        return
+    
+    log_watchdog_event(job_dir, "noack_detected", f"notify_count={status.get('notify_count', 0)}")
+    
+    print(f"[NOACK] {job_id}: DONE but not acknowledged")
+    
+    if not dry_run:
+        result_path = job_dir / "result.md"
+        if result_path.exists():
+            send_notification(job_id, status, result_path)
+
+
+def handle_failed_job(job_id: str, status: dict, dry_run: bool):
+    """处理失败任务 (可选自动重试)"""
+    job_dir = JOBS_DIR / job_id
+    spec = load_spec(job_id)
+    
+    if not spec:
+        return
+    
+    attempt = status.get("attempt", 0)
+    max_attempts = status.get("max_attempts", 3)
+    error_class = status.get("error_class")
+    
+    # 检查是否应该重试
+    if not should_retry(error_class, attempt, max_attempts):
+        log_watchdog_event(job_dir, "failed_final", 
+                           f"error_class={error_class}, no retry")
+        return
+    
+    log_watchdog_event(job_dir, "failed_retry", 
+                       f"error_class={error_class}, attempt={attempt}/{max_attempts}")
+    
+    print(f"[FAILED] {job_id}: {error_class}, can retry ({attempt}/{max_attempts})")
+    
+    # 这里可以选择自动重试
+    # 暂时不自动重试 FAILED 任务，留给手动处理
+
+
+def scan_jobs() -> list:
+    """扫描所有 job 目录"""
+    jobs = []
+    for d in JOBS_DIR.iterdir():
+        if d.is_dir() and (d / "status.json").exists():
+            jobs.append(d.name)
+    return sorted(jobs)
+
+
+def run_watchdog(stuck_timeout: int, dry_run: bool = False):
+    """执行一轮 watchdog 检查"""
+    jobs = scan_jobs()
+    
+    print(f"[SCAN] {len(jobs)} jobs")
+    
+    stats = {
+        "stuck": 0,
+        "noack": 0,
+        "failed": 0
+    }
+    
+    for job_id in jobs:
+        job_dir = JOBS_DIR / job_id
+        status, rev = read_status_with_rev(job_dir)
+        
+        if not status:
+            continue
+        
+        state = status.get("state")
+        
+        # 检查 STUCK (考虑 lease)
+        if state == "RUNNING" and check_stuck_with_lease(job_id, stuck_timeout):
+            handle_stuck_job(job_id, status, dry_run)
+            stats["stuck"] += 1
+        
+        # 检查 DONE 未 ACK
+        elif state == "DONE" and not is_acked(job_dir):
+            handle_done_noack(job_id, status, dry_run)
+            stats["noack"] += 1
+        
+        # 检查 FAILED
+        elif state == "FAILED":
+            handle_failed_job(job_id, status, dry_run)
+            stats["failed"] += 1
+    
+    return stats
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Job watchdog (v3)")
+    parser.add_argument("--interval", type=int, default=DEFAULT_INTERVAL, help="Check interval in seconds")
+    parser.add_argument("--stuck-timeout", type=int, default=DEFAULT_STUCK_TIMEOUT, help="STUCK timeout in minutes")
+    parser.add_argument("--dry-run", action="store_true", help="Check only, no actions")
+    parser.add_argument("--once", action="store_true", help="Run once and exit")
+    
+    args = parser.parse_args()
+    
+    print(f"[START] Watchdog v3")
+    print(f"[CONFIG] stuck_timeout={args.stuck_timeout}min, interval={args.interval}s")
+    
+    if args.dry_run:
+        print("[DRY-RUN] No actions will be taken")
+    
+    if args.once:
+        stats = run_watchdog(args.stuck_timeout, args.dry_run)
+        print(f"[DONE] stuck={stats['stuck']}, noack={stats['noack']}, failed={stats['failed']}")
+        return 0
+    
+    # 持续运行模式
+    while True:
+        try:
+            stats = run_watchdog(args.stuck_timeout, args.dry_run)
+            print(f"[TICK] stuck={stats['stuck']}, noack={stats['noack']}, failed={stats['failed']}")
+        except Exception as e:
+            print(f"[ERROR] {e}")
+        
+        time.sleep(args.interval)
+    
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
