@@ -364,6 +364,34 @@ def cmd_retry(args):
 
 
 def main():
+    # Health check for tool_doctor (before argparse)
+    if "--health" in sys.argv:
+        checks = {
+            "jobs_dir_exists": JOBS_DIR.exists(),
+            "jobs_dir_writable": JOBS_DIR.exists() and os.access(JOBS_DIR, os.W_OK),
+        }
+        all_healthy = all(checks.values())
+        result = {
+            "status": "healthy" if all_healthy else "unhealthy",
+            "version": "1.0",
+            "checks": checks
+        }
+        print(json.dumps(result))
+        return 0 if all_healthy else 1
+    
+    # Sample call for tool_doctor
+    if "--sample" in sys.argv:
+        jobs = scan_jobs()
+        result = {
+            "status": "ok",
+            "sample_result": {
+                "jobs_count": len(jobs),
+                "jobs_dir": str(JOBS_DIR)
+            }
+        }
+        print(json.dumps(result))
+        return 0
+    
     parser = argparse.ArgumentParser(description="Job control tool")
     subparsers = parser.add_subparsers(dest="command", required=True)
     

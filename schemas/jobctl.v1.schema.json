@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "jobctl.v1.schema.json",
+  "title": "JobCtl Tool Schema v1",
+  "description": "Schema for LongRunKit jobctl tool",
+  "type": "object",
+  "definitions": {
+    "Input": {
+      "type": "object",
+      "properties": {
+        "command": {
+          "type": "string",
+          "enum": ["ls", "show", "tail", "ack", "cancel", "retry", "--health", "--sample"],
+          "description": "Command to execute"
+        },
+        "job_id": {
+          "type": "string",
+          "description": "Job ID for show/tail/ack/cancel/retry commands"
+        },
+        "state": {
+          "type": "string",
+          "description": "Filter by state for ls command"
+        }
+      }
+    },
+    "HealthOutput": {
+      "type": "object",
+      "required": ["status", "version", "checks"],
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["healthy", "unhealthy"]
+        },
+        "version": { "type": "string" },
+        "checks": {
+          "type": "object",
+          "properties": {
+            "jobs_dir_exists": { "type": "boolean" },
+            "jobs_dir_writable": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "ListOutput": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "job_id": { "type": "string" },
+          "state": { "type": "string" },
+          "age": { "type": "string" },
+          "attempt": { "type": "string" }
+        }
+      }
+    },
+    "Error": {
+      "type": "object",
+      "required": ["error"],
+      "properties": {
+        "error": {
+          "type": "object",
+          "required": ["type", "message"],
+          "properties": {
+            "type": { "type": "string" },
+            "message": { "type": "string" },
+            "code": { "type": "string" }
+          }
+        }
+      }
+    }
+  }
+}
