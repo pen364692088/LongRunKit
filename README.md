@@ -72,7 +72,39 @@ python3 tools/jobctl cancel <job_id> --reason "不再需要"
 python3 tools/jobctl retry <job_id>
 ```
 
-### 启动 Watchdog
+### 自动启动机制 (v0.3 新增)
+
+防止任务在 QUEUED 状态卡住：
+
+```bash
+# 提交时自动启动 worker (--auto-start)
+python3 tools/job-submit-ocl "任务描述" --repo /path/to/repo --auto-start
+
+# 检查并确保 worker 运行
+python3 tools/job-auto-start ensure
+
+# 查看 pool 状态
+python3 tools/job-auto-start status
+```
+
+### Systemd 集成
+
+```bash
+# 安装服务
+cp systemd/longrunkit-job-pool.service ~/.config/systemd/user/
+cp systemd/longrunkit-job-watchdog.* ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+# 方式 1: 持续运行的 pool
+systemctl --user enable longrunkit-job-pool
+systemctl --user start longrunkit-job-pool
+
+# 方式 2: 定时检查 (每 5 分钟)
+systemctl --user enable longrunkit-job-watchdog.timer
+systemctl --user start longrunkit-job-watchdog.timer
+```
+
+## 启动 Watchdog
 
 ```bash
 # 单次检查
@@ -101,12 +133,17 @@ LongRunKit/
 ├── tools/
 │   ├── joblib.py           # 核心库 (原子写入、锁、lease、安全)
 │   ├── jobctl              # 管理工具 (ls/show/tail/ack/cancel/retry)
-│   ├── job-submit-ocl      # 提交器
+│   ├── job-submit-ocl      # 提交器 (--auto-start 支持)
 │   ├── job-worker-v3       # 增强版 worker
 │   ├── job-watchdog-v3     # 增强版 watchdog
 │   ├── jobindex            # SQLite 索引
 │   ├── job-pool            # Worker Pool
+│   ├── job-auto-start      # 自动启动机制
 │   └── job-validator       # 安全验证
+├── systemd/                 # Systemd 服务文件
+│   ├── longrunkit-job-pool.service
+│   ├── longrunkit-job-watchdog.service
+│   └── longrunkit-job-watchdog.timer
 └── tests/
     ├── test-job-protocol.py    # v0.1 测试 (5/5)
     ├── test-job-protocol-v2.py # v0.2 测试 (9/9)
