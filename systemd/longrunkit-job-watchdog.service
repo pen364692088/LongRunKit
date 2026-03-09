@@ -1,0 +1,22 @@
+# LongRunKit Job Watchdog Timer
+# 
+# 安装:
+#   cp longrunkit-job-watchdog.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable longrunkit-job-watchdog.timer
+#   systemctl --user start longrunkit-job-watchdog.timer
+#
+# 查看:
+#   systemctl --user list-timers
+#   journalctl --user -u longrunkit-job-watchdog -f
+
+[Unit]
+Description=LongRunKit Job Watchdog
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/moonlight/Project/Github/MyProject/LongRunKit
+ExecStart=/usr/bin/python3 /home/moonlight/Project/Github/MyProject/LongRunKit/tools/job-auto-start ensure
+
+[Install]
+WantedBy=default.target

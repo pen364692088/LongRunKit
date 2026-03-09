@@ -1,0 +1,28 @@
+# LongRunKit Job Pool Service
+# 
+# 安装:
+#   cp longrunkit-job-pool.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable longrunkit-job-pool
+#   systemctl --user start longrunkit-job-pool
+#
+# 查看:
+#   systemctl --user status longrunkit-job-pool
+#   journalctl --user -u longrunkit-job-pool -f
+#
+# 停止:
+#   systemctl --user stop longrunkit-job-pool
+
+[Unit]
+Description=LongRunKit Job Pool
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/moonlight/Project/Github/MyProject/LongRunKit
+ExecStart=/usr/bin/python3 /home/moonlight/Project/Github/MyProject/LongRunKit/tools/job-pool start -c 3
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

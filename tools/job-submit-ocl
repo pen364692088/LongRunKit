@@ -10,6 +10,7 @@ job-submit-ocl - OpenClaw 集成的 Job 提交器
     2. 通过 sessions_spawn 启动 worker (真正异步)
     3. 立即返回 job_id (不阻塞)
     4. 可选 --follow 模式等待结果
+    5. 自动启动 worker (--auto-start 或 --ensure-worker)
 """
 
 import argparse
@@ -47,6 +48,44 @@ def write_json(path: Path, data: dict):
 def read_json(path: Path) -> dict:
     with open(path) as f:
         return json.load(f)
+
+
+def check_pool_running() -> bool:
+    """检查 job-pool 是否在运行"""
+    pid_file = JOBS_DIR / "pool.pid"
+    
+    if not pid_file.exists():
+        return False
+    
+    try:
+        pid_data = json.loads(pid_file.read_text())
+        pid = pid_data.get("pid")
+        
+        if not pid:
+            return False
+        
+        # 检查进程是否存在
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, FileNotFoundError, json.JSONDecodeError):
+        return False
+
+
+def ensure_worker(model: str = DEFAULT_MODEL) -> bool:
+    """确保 worker 在运行"""
+    if check_pool_running():
+        return True
+    
+    # 调用 job-auto-start
+    auto_start_script = Path(__file__).parent / "job-auto-start"
+    
+    result = subprocess.run(
+        ["python3", str(auto_start_script), "ensure", "-m", model],
+        capture_output=True,
+        text=True
+    )
+    
+    return result.returncode == 0
 
 
 def submit_job(task: str, args) -> str:
@@ -93,21 +132,30 @@ def submit_job(task: str, args) -> str:
     write_json(job_dir / "spec.json", spec)
     write_json(job_dir / "status.json", status)
     
-    # 输出 spawn 命令
-    worker_script = Path(__file__).parent / "job-worker-v2"
-    
     print(f"Job ID: {job_id}")
     print(f"Status: QUEUED")
-    print()
-    print("To spawn worker manually:")
-    print(f"  sessions_spawn runtime=subagent model={args.model} \\")
-    print(f"    task='python3 {worker_script} {job_id}'")
-    print()
-    print("Or use subtask-orchestrate:")
-    print(f"  ~/.openclaw/workspace/tools/subtask-orchestrate run \\")
-    print(f"    'Job {job_id}: {spec['title']}' -m {args.model}")
-    print()
-    print(f"Check status: cat {job_dir}/status.json")
+    print(f"Repo: {spec['inputs']['repo']}")
+    print(f"Title: {spec['title']}")
+    
+    # 检查 worker 状态
+    pool_running = check_pool_running()
+    
+    if pool_running:
+        print("\n✓ Pool is running, job will be picked up soon")
+    else:
+        print("\n⚠ Pool is NOT running!")
+        
+        if args.auto_start or args.ensure_worker:
+            print("  Starting worker...")
+            if ensure_worker(args.model):
+                print("  ✓ Worker started")
+            else:
+                print("  ✗ Failed to start worker")
+        else:
+            print("  Use --auto-start to start worker automatically")
+            print("  Or run: python3 tools/job-auto-start ensure")
+    
+    print(f"\nCheck status: python3 tools/jobctl show {job_id}")
     print(f"Get result: cat {job_dir}/result.md")
     
     return job_id
@@ -166,6 +214,8 @@ def main():
     parser.add_argument("--command", help="Shell command (for shell_task)")
     parser.add_argument("--follow", action="store_true", help="Wait for completion")
     parser.add_argument("--follow-timeout", type=int, default=300, help="Follow timeout in seconds")
+    parser.add_argument("--auto-start", action="store_true", help="Auto-start worker if not running")
+    parser.add_argument("--ensure-worker", action="store_true", help="Same as --auto-start")
     
     args = parser.parse_args()
     

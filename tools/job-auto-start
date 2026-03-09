@@ -1,0 +1,306 @@
+#!/usr/bin/env python3
+"""
+job-auto-start - 自动启动 worker 执行 QUEUED 任务
+
+用法:
+    job-auto-start check              # 检查是否有 QUEUED 任务
+    job-auto-start start              # 启动 job-pool (后台)
+    job-auto-start run-one            # 直接执行一个任务
+    job-auto-start ensure             # 确保有 worker 运行 (无则启动)
+    job-auto-start status             # 显示 pool 状态
+
+设计目标:
+1. 提交任务后自动启动 worker
+2. watchdog 定时调用 ensure 确保任务被执行
+3. 避免 QUEUED 任务积压
+"""
+
+import argparse
+import json
+import os
+import sys
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Optional, List
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from joblib import (
+    JOBS_DIR, read_status_with_rev, update_status_safe,
+    acquire_lease, release_lease, is_lease_expired,
+    log_worker_event, atomic_write_json
+)
+
+
+def scan_queued_jobs() -> List[str]:
+    """扫描 QUEUED 状态的任务"""
+    jobs = []
+    for d in JOBS_DIR.iterdir():
+        if d.is_dir() and (d / "status.json").exists():
+            status, _ = read_status_with_rev(d)
+            if status and status.get("state") == "QUEUED":
+                jobs.append(d.name)
+    return sorted(jobs)
+
+
+def check_pool_running() -> bool:
+    """检查 job-pool 是否在运行"""
+    pid_file = JOBS_DIR / "pool.pid"
+    
+    if not pid_file.exists():
+        return False
+    
+    try:
+        pid_data = json.loads(pid_file.read_text())
+        pid = pid_data.get("pid")
+        
+        if not pid:
+            return False
+        
+        # 检查进程是否存在
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, FileNotFoundError, json.JSONDecodeError):
+        return False
+
+
+def get_pool_status() -> dict:
+    """获取 pool 状态"""
+    status_file = JOBS_DIR / "pool_status.json"
+    
+    if status_file.exists():
+        try:
+            return json.loads(status_file.read_text())
+        except:
+            pass
+    
+    return {"running": False}
+
+
+def start_pool(concurrency: int = 3, model: str = "baiduqianfancodingplan/qianfan-code-latest", background: bool = True) -> bool:
+    """
+    启动 job-pool
+    
+    Args:
+        concurrency: 并发数
+        model: 模型
+        background: 是否后台运行
+    
+    Returns:
+        是否成功启动
+    """
+    if check_pool_running():
+        print("Pool already running")
+        return True
+    
+    pool_script = Path(__file__).parent / "job-pool"
+    
+    if background:
+        # 后台启动
+        cmd = f"nohup python3 {pool_script} start -c {concurrency} -m {model} > /dev/null 2>&1 &"
+        subprocess.run(cmd, shell=True)
+        
+        # 等待启动
+        time.sleep(1)
+        
+        if check_pool_running():
+            print(f"✓ Pool started (concurrency={concurrency})")
+            return True
+        else:
+            print("✗ Failed to start pool")
+            return False
+    else:
+        # 前台运行
+        os.execvp("python3", ["python3", str(pool_script), "start", "-c", str(concurrency), "-m", model])
+        return True
+
+
+def run_one_job(model: str = "baiduqianfancodingplan/qianfan-code-latest") -> bool:
+    """
+    直接执行一个 QUEUED 任务
+    
+    不启动 pool，直接调用 job-worker-v3
+    
+    Returns:
+        是否成功执行
+    """
+    jobs = scan_queued_jobs()
+    
+    if not jobs:
+        print("No QUEUED jobs to run")
+        return False
+    
+    job_id = jobs[0]
+    job_dir = JOBS_DIR / job_id
+    
+    # 尝试获取 lease
+    worker_id = f"auto-start:{os.getpid()}"
+    
+    if not acquire_lease(job_dir, worker_id, duration_minutes=60):
+        print(f"Cannot acquire lease for {job_id}")
+        return False
+    
+    # 更新状态为 RUNNING
+    update_status_safe(job_dir, {
+        "state": "RUNNING",
+        "worker_session": worker_id
+    })
+    
+    print(f"Running job: {job_id}")
+    
+    # 执行 worker
+    worker_script = Path(__file__).parent / "job-worker-v3"
+    
+    try:
+        result = subprocess.run(
+            ["python3", str(worker_script), job_id],
+            capture_output=True,
+            text=True,
+            timeout=3600
+        )
+        
+        if result.returncode == 0:
+            print(f"✓ Job completed: {job_id}")
+            return True
+        else:
+            print(f"✗ Job failed: {job_id}")
+            print(result.stderr[:500])
+            return False
+    
+    except subprocess.TimeoutExpired:
+        print(f"✗ Job timed out: {job_id}")
+        return False
+    
+    finally:
+        release_lease(job_dir, worker_id)
+
+
+def ensure_worker_running(concurrency: int = 3, model: str = "baiduqianfancodingplan/qianfan-code-latest") -> str:
+    """
+    确保有 worker 在运行
+    
+    如果有 QUEUED 任务但没有 pool 运行，则启动 pool
+    
+    Returns:
+        "running" | "started" | "no_jobs" | "failed"
+    """
+    jobs = scan_queued_jobs()
+    
+    if not jobs:
+        return "no_jobs"
+    
+    if check_pool_running():
+        return "running"
+    
+    # 启动 pool
+    if start_pool(concurrency, model, background=True):
+        return "started"
+    else:
+        return "failed"
+
+
+def cmd_check(args):
+    """检查是否有 QUEUED 任务"""
+    jobs = scan_queued_jobs()
+    
+    if jobs:
+        print(f"QUEUED jobs: {len(jobs)}")
+        for job_id in jobs[:5]:
+            print(f"  - {job_id}")
+        if len(jobs) > 5:
+            print(f"  ... and {len(jobs) - 5} more")
+        return 0
+    else:
+        print("No QUEUED jobs")
+        return 0
+
+
+def cmd_start(args):
+    """启动 job-pool"""
+    if start_pool(args.concurrency, args.model, background=not args.foreground):
+        return 0
+    return 1
+
+
+def cmd_run_one(args):
+    """直接执行一个任务"""
+    if run_one_job(args.model):
+        return 0
+    return 1
+
+
+def cmd_ensure(args):
+    """确保有 worker 运行"""
+    result = ensure_worker_running(args.concurrency, args.model)
+    
+    if result == "no_jobs":
+        print("No QUEUED jobs, nothing to do")
+        return 0
+    elif result == "running":
+        print("Pool already running")
+        return 0
+    elif result == "started":
+        print("✓ Pool started")
+        return 0
+    else:
+        print("✗ Failed to start pool")
+        return 1
+
+
+def cmd_status(args):
+    """显示 pool 状态"""
+    if check_pool_running():
+        print("Pool: RUNNING")
+        status = get_pool_status()
+        print(json.dumps(status, indent=2))
+    else:
+        print("Pool: STOPPED")
+    
+    jobs = scan_queued_jobs()
+    print(f"QUEUED jobs: {len(jobs)}")
+    
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Auto-start worker for QUEUED jobs")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    
+    # check
+    subparsers.add_parser("check", help="Check for QUEUED jobs")
+    
+    # start
+    start_parser = subparsers.add_parser("start", help="Start job-pool")
+    start_parser.add_argument("--concurrency", "-c", type=int, default=3)
+    start_parser.add_argument("--model", "-m", default="baiduqianfancodingplan/qianfan-code-latest")
+    start_parser.add_argument("--foreground", "-f", action="store_true", help="Run in foreground")
+    
+    # run-one
+    run_one_parser = subparsers.add_parser("run-one", help="Run one QUEUED job directly")
+    run_one_parser.add_argument("--model", "-m", default="baiduqianfancodingplan/qianfan-code-latest")
+    
+    # ensure
+    ensure_parser = subparsers.add_parser("ensure", help="Ensure worker is running if there are QUEUED jobs")
+    ensure_parser.add_argument("--concurrency", "-c", type=int, default=3)
+    ensure_parser.add_argument("--model", "-m", default="baiduqianfancodingplan/qianfan-code-latest")
+    
+    # status
+    subparsers.add_parser("status", help="Show pool status")
+    
+    args = parser.parse_args()
+    
+    commands = {
+        "check": cmd_check,
+        "start": cmd_start,
+        "run-one": cmd_run_one,
+        "ensure": cmd_ensure,
+        "status": cmd_status,
+    }
+    
+    return commands[args.command](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

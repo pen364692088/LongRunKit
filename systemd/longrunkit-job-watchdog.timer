@@ -1,0 +1,20 @@
+# LongRunKit Job Watchdog Timer
+# 
+# 每 5 分钟检查一次是否有 QUEUED 任务需要执行
+#
+# 安装:
+#   cp longrunkit-job-watchdog.* ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable longrunkit-job-watchdog.timer
+#   systemctl --user start longrunkit-job-watchdog.timer
+
+[Unit]
+Description=Run LongRunKit job watchdog every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Unit=longrunkit-job-watchdog.service
+
+[Install]
+WantedBy=timers.target
